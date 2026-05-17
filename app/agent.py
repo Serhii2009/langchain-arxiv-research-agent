@@ -4,7 +4,7 @@ import logging
 from dotenv import load_dotenv
 
 from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain_core.messages import HumanMessage, ToolMessage
+from langchain_core.messages import HumanMessage, ToolMessage, AIMessage
 from langgraph.prebuilt import create_react_agent
 from langgraph.checkpoint.memory import MemorySaver
 
@@ -18,23 +18,67 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("arxiv_assistant")
 
-SYSTEM_PROMPT = """You are an expert AI/ML Research Assistant specialized in discovering,
-analyzing, and synthesizing academic literature from ArXiv.
+SYSTEM_PROMPT = """You are an elite AI/ML Research Analyst. Your job is NOT to summarize papers — 
+the UI already shows paper cards with abstracts. Your job is to produce a deep, insightful 
+research briefing that a senior ML engineer would find genuinely valuable.
 
-Your capabilities:
-- search_arxiv_papers: Deep semantic search across ArXiv, returns structured paper metadata
-- analyze_paper: Extract key contributions, methodology, and findings from a paper
-- design_experiment: Suggest concrete experiments based on the literature found
-- calculate_ml_metrics: Calculate Accuracy, Precision, Recall, F1, MCC from confusion matrix values
-- generate_action_items: Produce prioritized next steps after a research session
+When a user gives you a research topic, follow this exact workflow:
 
-Behavior rules:
-1. Always start with search_arxiv_papers when the user asks about a research topic
-2. After search, automatically call analyze_paper on the top 2-3 most relevant results
-3. Always end a research session with generate_action_items
-4. When the user asks a follow-up referencing previous papers, use the titles from memory
-5. For metric questions always use calculate_ml_metrics, never approximate in prose
-6. Be precise about paper titles and arxiv IDs — never fabricate them"""
+STEP 1 — Search
+Call search_arxiv_papers to find the most relevant recent papers (prioritize 2025-2026).
+
+STEP 2 — Analyze
+Call analyze_paper on the 2-3 most important results to extract deep technical details.
+
+STEP 3 — Generate action items
+Call generate_action_items with the topic and key insights found.
+
+STEP 4 — Write your response using this exact structure:
+
+---
+
+## 🧠 What is [TOPIC]?
+Explain the concept from first principles. Use intuitive analogies. Assume the reader knows 
+ML basics but has not studied this specific topic. Be concrete, not vague.
+
+## 🔍 Why does it matter?
+Explain the core tension or open problem this research area is trying to solve. 
+What breaks without understanding this? What becomes possible if we do understand it?
+
+## 📡 What the 2025–2026 research frontier looks like
+Based on the papers you found, describe the active research directions RIGHT NOW.
+Do NOT list papers — describe the intellectual landscape:
+- What are the main competing hypotheses or approaches?
+- Where do researchers disagree?
+- What has been recently proven or disproven?
+- What surprising findings emerged?
+
+## 🧪 Experiment you could run tomorrow
+Design ONE concrete, novel experiment that:
+- Has not been described in the papers you found
+- Could be done on a single GPU or Google Colab
+- Would produce a meaningful, publishable insight
+- Includes: hypothesis, dataset, model setup, what to measure, expected outcome
+
+## 🗺️ Research directions worth pursuing
+List 3-4 specific open questions or directions that are:
+- Not yet answered by existing literature
+- Tractable for a small research team
+- Likely to produce impactful results
+
+## ✅ Action items
+From generate_action_items output — concrete next steps, resources, repos to explore.
+
+---
+
+CRITICAL RULES:
+- Never say 'Paper X discusses...' or 'According to paper Y...' — synthesize, don't cite
+- Never repeat information already visible in paper cards (titles, abstracts, authors)
+- Write as if explaining to a brilliant colleague over coffee, not as an academic report
+- Be specific: name architectures, datasets, metrics, failure modes
+- The experiment section must be genuinely novel — not a replication of found papers
+- Minimum 600 words in your final response
+- Always use the section headers exactly as shown above"""
 
 TOOLS = [
     search_arxiv_papers,
@@ -47,34 +91,36 @@ TOOLS = [
 
 def build_llm(temperature: float = 0.3) -> ChatGoogleGenerativeAI:
     return ChatGoogleGenerativeAI(
-        model="gemini-2.5-flash",
+        model="gemini-2.5-flash-preview-05-20",
         temperature=temperature,
-        max_output_tokens=2048,
+        max_output_tokens=4096,
         google_api_key=os.getenv("GOOGLE_API_KEY"),
     )
 
 
 def _to_str(content) -> str:
+    """Converts any Gemini content format to plain string."""
     if isinstance(content, str):
         return content
     if isinstance(content, list):
-        return " ".join(
-            b.get("text", "") if isinstance(b, dict) else str(b)
-            for b in content
-        )
+        parts = []
+        for block in content:
+            if isinstance(block, dict):
+                parts.append(block.get("text", ""))
+            else:
+                parts.append(str(block))
+        return " ".join(p for p in parts if p).strip()
     return str(content)
 
 
 def _parse_papers_from_tool_output(text: str) -> list:
-    """
-    Parses the structured output of search_arxiv_papers tool into paper dicts.
-    """
+    """Parses structured output of search_arxiv_papers into paper dicts."""
     import re
     papers = []
     blocks = re.split(r"\[\d+\]", text)
 
     for block in blocks[1:]:
-        lines = [l.strip() for l in block.strip().split("\n") if l.strip()]
+        lines = [line.strip() for line in block.strip().split("\n") if line.strip()]
         if not lines:
             continue
 
@@ -111,6 +157,28 @@ def _parse_papers_from_tool_output(text: str) -> list:
     return papers
 
 
+def _extract_final_answer(messages: list) -> str:
+    """
+    Finds the last AIMessage that contains actual text content
+    and does not contain tool_calls — that is the final answer.
+    """
+    for msg in reversed(messages):
+        if not isinstance(msg, AIMessage):
+            continue
+
+        # Skip messages that are just tool invocations with no text
+        tool_calls = getattr(msg, "tool_calls", None)
+        content_str = _to_str(msg.content).strip()
+
+        if tool_calls and not content_str:
+            continue
+
+        if content_str:
+            return content_str
+
+    return "The agent completed the search but did not produce a final summary. Try asking: 'Summarize what you found.'"
+
+
 class AgentWrapper:
     def __init__(self, memory_type: str = "buffer"):
         self.memory_type = memory_type
@@ -135,13 +203,17 @@ class AgentWrapper:
                 config=config,
             )
             messages = result.get("messages", [])
+
             if not messages:
                 return {"output": "No response generated.", "papers": []}
 
-            # Extract final assistant text
-            output = _to_str(messages[-1].content)
+            # Log all message types for debugging
+            for i, msg in enumerate(messages):
+                logger.info(f"[AGENT] msg[{i}] type={type(msg).__name__} content_len={len(_to_str(msg.content))}")
 
-            # Extract papers from all ToolMessage outputs in this turn
+            output = _extract_final_answer(messages)
+
+            # Extract papers from ToolMessage outputs
             papers = []
             for msg in messages:
                 if isinstance(msg, ToolMessage):
@@ -150,12 +222,12 @@ class AgentWrapper:
                         parsed = _parse_papers_from_tool_output(tool_text)
                         papers.extend(parsed)
 
-            logger.info(f"[AGENT] Response: {len(output)} chars, {len(papers)} papers extracted")
+            logger.info(f"[AGENT] Final output: {len(output)} chars | Papers: {len(papers)}")
             return {"output": output, "papers": papers}
 
         except Exception as e:
             logger.error(f"[AGENT] invoke error: {e}")
-            return {"output": f"Error: {str(e)}", "papers": []}
+            return {"output": f"⚠️ Error: {str(e)}", "papers": []}
 
     def clear_memory(self):
         self.thread_id = str(uuid.uuid4())
