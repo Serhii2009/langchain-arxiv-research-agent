@@ -47,7 +47,7 @@ def render_paper_card(paper: dict, index: int) -> None:
         with st.expander("📖 Read abstract", expanded=False):
             st.write(abstract)
 
-        btn_col1, btn_col2, _ = st.columns([0.2, 0.2, 0.6])
+        btn_col1, btn_col2, _ = st.columns([0.28, 0.28, 0.44])
         with btn_col1:
             if pdf_url:
                 st.link_button("📄 PDF", pdf_url, use_container_width=True)

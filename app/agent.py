@@ -91,7 +91,7 @@ TOOLS = [
 
 def build_llm(temperature: float = 0.3) -> ChatGoogleGenerativeAI:
     return ChatGoogleGenerativeAI(
-        model="gemini-2.5-flash-preview-05-20",
+        model="gemini-2.5-flash",
         temperature=temperature,
         max_output_tokens=4096,
         google_api_key=os.getenv("GOOGLE_API_KEY"),
